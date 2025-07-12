@@ -308,6 +308,86 @@ def Train_by_piece(folder, nb_pieces=20, quantization=24, maxOrder=20, time_repr
 	except Exception as e:
 		rmtree(name_temp_file)
 
+def update(folder, initialization="", quantization=24, maxOrder=20, time_representation=False, zero_padding=True, long_term_only=False, short_term_only=False, viewPoints=["pitch", "length"], use_original_PPM=False):
+    """
+    Note-wise learning rate: Analyze each note, record distribution changes (KL divergence) before and after updates, and calculate IC and Entropy.
+    """
+    eps = 1e-12
+    
+    # Initialize IDyOM model with specified parameters
+    L = idyom.idyom(maxOrder=maxOrder, viewPoints=viewPoints, evolutive=True, use_original_PPM=use_original_PPM)
+    
+    # Pre-training phase: load initialization data if provided
+    if initialization:
+        M0 = data.data(quantization=quantization)
+        M0.parse(initialization, augment=True)
+        L.train(M0)  # Train long-term memory on initialization corpus
+    
+    # Collect all MIDI files from the target folder recursively
+    files = [f for f in glob(folder.rstrip('/')+'/**', recursive=True) if f.endswith(('.mid','.midi'))]
+    results = {}  # Store results for each file and viewpoint
+    
+    # Process each MIDI file with progress tracking
+    for filepath in tqdm(files, desc="Note-wise update"):
+        # Extract clean filename for results dictionary
+        fname = os.path.splitext(os.path.basename(filepath))[0].replace('-', '_')
+        
+        # Parse current MIDI file
+        Mfile = data.data(quantization=quantization)
+        Mfile.parseFile(filepath)
+        file_out = {}  # Store results for current file
+        
+        # Analyze each viewpoint (pitch, length, etc.) separately
+        for vp_idx, vp in enumerate(viewPoints):
+            seq = Mfile.viewPointRepresentation[vp][0]  # Get sequence for this viewpoint
+            note_list = []  # Store metrics for each note in sequence
+            
+            # Process each note in the sequence (skip first note as it has no context)
+            for i in range(1, len(seq)):
+                ctx = seq[:i]  # Context: all previous notes
+                note = seq[i]  # Current note to predict
+                
+                # Get model's prediction distribution before update
+                dist_pre = L.LTM[vp_idx].getPrediction(ctx)
+                p_note = dist_pre.get(str(note), 0.0)  # Probability of actual note
+                
+                # Calculate Information Content (surprise) of the note
+                IC = -math.log(p_note+eps, 2)
+                
+                # Calculate entropy of the prediction distribution
+                Ent = -sum(p*math.log(p+eps, 2) for p in dist_pre.values())
+                
+                # Update model with this note (incremental learning)
+                L.train_one(ctx, note, shortTerm=False)
+                
+                # Get model's prediction distribution after update
+                dist_post = L.LTM[vp_idx].getPrediction(ctx)
+                
+                # Calculate KL divergence between pre and post distributions
+                keys = set(dist_pre)|set(dist_post)  # Union of all symbols
+                KL = 0.0
+                for k in keys:
+                    p = dist_pre.get(k,0.0)   # Probability before update
+                    q = dist_post.get(k,0.0)  # Probability after update
+                    KL += p*math.log((p+eps)/(q+eps), 2)  # KL divergence formula
+                
+                # Store all metrics for this note
+                note_list.append({'idx':i, 'IC':IC, 'Entropy':Ent, 'KL':KL})
+            
+            file_out[vp] = note_list  # Store note list for this viewpoint
+        
+        results[fname] = file_out  # Store file results
+    
+    # Save results to output directory
+    base = os.path.basename(folder.rstrip('/'))  # Get folder name for output
+    out_dir = os.path.join('out', base+'_notewise')
+    os.makedirs(out_dir, exist_ok=True)  # Create output directory
+    
+    # Save in both MATLAB and pickle formats
+    sio.savemat(os.path.join(out_dir, base+'_notewise.mat'), results)
+    pickle.dump(results, open(os.path.join(out_dir, base+'_notewise.pickle'),'wb'))
+    print(f"Note-wise learning rate saved to: {out_dir}")
+
 
 def SurpriseOverFolder(folderTrain, folder, k_fold=5, quantization=24, maxOrder=20, time_representation=False, \
 											zero_padding=True, long_term_only=False, short_term_only=False,\
@@ -606,6 +686,10 @@ if __name__ == "__main__":
 					  help="Train and evaluate over training on the passed folder (cross-val).",
 					  dest="train_test_folder", default=None)	
 
+	parser.add_option("-u", "--update", type="string",
+					  help="Per-note evolution: train on each note and report IC and Entropy; can initialize with -i.",
+					  dest="update_folder", default=None)
+
 	parser.add_option("-i", "--init_evolution", type="string",
 					  help="Folder to initialize the evolution on.",
 					  dest="intialization", default="")	
@@ -626,6 +710,10 @@ if __name__ == "__main__":
 		time_representation = True
 	else:
 		time_representation = False
+
+	if options.update_folder:
+		print("Per-note evolution ...")
+		update(options.update_folder, initialization=options.intialization, quantization=options.quantization, maxOrder=options.max_order, time_representation=time_representation, zero_padding=options.zero_padding==1, long_term_only=options.long_term_only==1, short_term_only=options.short_term_only==1, viewPoints=options.viewPoints, use_original_PPM=options.use_original_PPM==1)
 
 	if options.train_test_folder is not None:
 		print("Evolution Training ...")

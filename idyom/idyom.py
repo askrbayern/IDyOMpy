@@ -54,6 +54,37 @@ class idyom():
 			self.LTM[k].train(data.getData(viewPoint), preComputeEntropies=preComputeEntropies)
 			k += 1
 
+	def train_one(self, ctx, note, shortTerm=False):
+		"""
+		Train the models with a single note given context
+		
+		:param ctx: context sequence
+		:param note: note to train with
+		:param shortTerm: whether to use short term training
+
+		:type ctx: list
+		:type note: dict or similar
+		:type shortTerm: bool
+		"""
+		# Convert note to viewpoint-specific data
+		viewpoint_data = {}
+		for viewPoint in self.viewPoints:
+			if isinstance(note, dict) and viewPoint in note:
+				viewpoint_data[viewPoint] = note[viewPoint]
+			else:
+				# Handle case where note is not a dict or doesn't have the viewpoint
+				viewpoint_data[viewPoint] = note
+
+		# Train each viewpoint model
+		for i, ltm in enumerate(self.LTM):
+			viewPoint = self.viewPoints[i]
+			if shortTerm:
+				ltm.train([ctx], shortTerm=True)
+			else:
+				# Create sequence with context + new note for this viewpoint
+				sequence = ctx + [viewpoint_data[viewPoint]]
+				ltm.train([sequence])
+
 	def mergeProbas(self, probas, weights, b=1):
 		"""
 		Merging probabilities from different models, for now we use arithmetic mean

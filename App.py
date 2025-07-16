@@ -8,6 +8,7 @@ from optparse import OptionParser
 from shutil import copyfile
 from shutil import rmtree
 from glob import glob
+from idyom.longTermModel import longTermModel
 from tqdm import tqdm
 import unittest
 import matplotlib.pyplot as plt
@@ -19,6 +20,18 @@ import scipy.io as sio
 import math
 import random
 import ast
+
+def _explain_kl_zero(pre_dist, post_dist, pre_is_deterministic, post_is_deterministic, distributions_identical):
+    """Explain why KL divergence is zero"""
+    if distributions_identical:
+        if pre_is_deterministic and post_is_deterministic:
+            return "Both distributions are deterministic (prob=1.0) and identical - no learning possible"
+        elif pre_is_deterministic or post_is_deterministic:
+            return "One distribution is deterministic, identical distributions"
+        else:
+            return "Distributions are numerically identical - possible precision issue"
+    else:
+        return "Distributions differ but KL=0 - unexpected case"
 
 SERVER = False
 
@@ -321,16 +334,22 @@ def update(folder, initialization="", quantization=24, maxOrder=20, time_represe
     if initialization:
         M0 = data.data(quantization=quantization)
         M0.parse(initialization, augment=True)
-        L.train(M0)  # Train long-term memory on initialization corpus
-    
+        L.train(M0)
+    # If no initialization provided, skip pre-training and rely on incremental updates
     # Collect all MIDI files from the target folder recursively
     files = [f for f in glob(folder.rstrip('/')+'/**', recursive=True) if f.endswith(('.mid','.midi'))]
     results = {}  # Store results for each file and viewpoint
+    file_order = []
+    piece_starts = []
+    cum_count = 0
     
     # Process each MIDI file with progress tracking
     for filepath in tqdm(files, desc="Note-wise update"):
         # Extract clean filename for results dictionary
         fname = os.path.splitext(os.path.basename(filepath))[0].replace('-', '_')
+        # Record order and start offset
+        file_order.append(fname)
+        piece_starts.append(cum_count)
         
         # Parse current MIDI file
         Mfile = data.data(quantization=quantization)
@@ -344,40 +363,181 @@ def update(folder, initialization="", quantization=24, maxOrder=20, time_represe
             
             # Process each note in the sequence (skip first note as it has no context)
             for i in range(1, len(seq)):
-                ctx = seq[:i]  # Context: all previous notes
+                # Always use up to maxOrder most recent notes as context
+                start = max(0, i - maxOrder)
+                ctx = seq[start:i]
                 note = seq[i]  # Current note to predict
                 
-                # Get model's prediction distribution before update
-                dist_pre = L.LTM[vp_idx].getPrediction(ctx)
-                p_note = dist_pre.get(str(note), 0.0)  # Probability of actual note
+                # Pre-update per-order LTM distributions (slice ctx by order)
+                pre_ltm_order_dist = []
+                # order 0
+                dist0 = L.LTM[vp_idx].modelOrder0.getPrediction()
+                pre_ltm_order_dist.append(dist0)
+                # orders 1..maxOrder
+                for mc in L.LTM[vp_idx].models:
+                    order_n = mc.order
+                    ctx_n = ctx[-order_n:] if len(ctx) >= order_n else ctx
+                    dist = mc.getPrediction(ctx_n)
+                    # Fallback: if this order hasn't learned any symbols yet, create uniform distribution
+                    # Use current note as minimal alphabet if even order-0 is empty
+                    if not dist:
+                        if dist0:
+                            dist = {str(k): 1.0/len(dist0) for k in dist0.keys()}
+                        else:
+                            # Even order-0 is empty, use current note as alphabet
+                            dist = {str(note): 1.0}
+                    pre_ltm_order_dist.append(dist)
                 
-                # Calculate Information Content (surprise) of the note
-                IC = -math.log(p_note+eps, 2)
+                # **FIX: 真正的增量训练 - 只用单个新观察更新模型**
+                # 为每个order构建对应的转换并更新计数
                 
-                # Calculate entropy of the prediction distribution
-                Ent = -sum(p*math.log(p+eps, 2) for p in dist_pre.values())
+                # Update order-0 model (just add the new note)
+                modelOrder0 = L.LTM[vp_idx].modelOrder0
+                new_note_str = str(note)
+                if new_note_str not in modelOrder0.SUM:
+                    modelOrder0.stateAlphabet.append(new_note_str)
+                    modelOrder0.SUM[new_note_str] = 0
+                modelOrder0.SUM[new_note_str] += 1
+                modelOrder0.globalCounter += 1
                 
-                # Update model with this note (incremental learning)
-                L.train_one(ctx, note, shortTerm=False)
+                # Update higher-order models incrementally
+                for mc in L.LTM[vp_idx].models:
+                    order_n = mc.order
+                    if len(ctx) >= order_n:  # Only update if we have enough context
+                        # Extract the specific n-gram transition: ctx[-order:] -> note
+                        state = ctx[-order_n:]
+                        state_str = str(list(state))
+                        target_str = str(note)
+                        
+                        # Initialize state if never seen
+                        if state_str not in mc.observationsProbas:
+                            mc.stateAlphabet.append(state_str)
+                            mc.SUM[state_str] = 0
+                            mc.observationsProbas[state_str] = {}
+                        
+                        # Add target to alphabet if new
+                        if target_str not in mc.alphabet:
+                            mc.alphabet.append(target_str)
+                        
+                        # Increment counts for this specific transition
+                        if target_str not in mc.observationsProbas[state_str]:
+                            mc.observationsProbas[state_str][target_str] = 1
+                        else:
+                            mc.observationsProbas[state_str][target_str] += 1
+                        mc.SUM[state_str] += 1
                 
-                # Get model's prediction distribution after update
-                dist_post = L.LTM[vp_idx].getPrediction(ctx)
+                # Post-update per-order LTM distributions (slice ctx by order)
+                post_ltm_order_dist = []
+                # order 0
+                post0 = L.LTM[vp_idx].modelOrder0.getPrediction()
+                post_ltm_order_dist.append(post0)
+                for mc in L.LTM[vp_idx].models:
+                    order_n = mc.order
+                    ctx_n = ctx[-order_n:] if len(ctx) >= order_n else ctx
+                    post_dist = mc.getPrediction(ctx_n)
+                    # Fallback: same as pre-update
+                    if not post_dist:
+                        if post0:
+                            post_dist = {str(k): 1.0/len(post0) for k in post0.keys()}
+                        else:
+                            # Even order-0 is empty, use current note as alphabet
+                            post_dist = {str(note): 1.0}
+                    post_ltm_order_dist.append(post_dist)
                 
-                # Calculate KL divergence between pre and post distributions
-                keys = set(dist_pre)|set(dist_post)  # Union of all symbols
-                KL = 0.0
-                for k in keys:
-                    p = dist_pre.get(k,0.0)   # Probability before update
-                    q = dist_post.get(k,0.0)  # Probability after update
-                    KL += p*math.log((p+eps)/(q+eps), 2)  # KL divergence formula
+                # Compute KL divergence and JS divergence per order
+                KL_ltm_per_order = []
+                JS_ltm_per_order = []
+                for pre, post in zip(pre_ltm_order_dist, post_ltm_order_dist):
+                    keys = set(pre.keys()) | set(post.keys())  # Dynamic union of all symbols
+                    
+                    # Handle special cases for KL divergence
+                    if not pre and post:
+                        # From empty to non-empty distribution: use cross-entropy
+                        kl_val = -sum(post[k] * math.log(post[k] + eps, 2) for k in post.keys())
+                    elif pre and not post:
+                        # From non-empty to empty: undefined, use large value
+                        kl_val = 100.0  # Large penalty
+                    elif not pre and not post:
+                        # Both empty: no change
+                        kl_val = 0.0
+                    else:
+                        # Standard KL divergence calculation
+                        kl_val = 0.0
+                        for k in keys:
+                            p_val = pre.get(k, eps)  # Use eps instead of 0 to avoid log(0)
+                            q_val = post.get(k, eps)
+                            if p_val > eps:  # Only include terms where p > 0
+                                kl_val += p_val * math.log(p_val / q_val, 2)
+                    
+                    KL_ltm_per_order.append(kl_val)
+                    
+                    # JS divergence (symmetric)
+                    if not pre and not post:
+                        js_val = 0.0
+                    else:
+                        # Ensure both distributions are non-empty for JS calculation
+                        pre_safe = pre if pre else {k: eps for k in post.keys()}
+                        post_safe = post if post else {k: eps for k in pre.keys()}
+                        keys_safe = set(pre_safe.keys()) | set(post_safe.keys())
+                        
+                        M = {k:(pre_safe.get(k, eps)+post_safe.get(k, eps))/2 for k in keys_safe}
+                        KL_pre_M = sum(pre_safe.get(k, eps) * math.log((pre_safe.get(k, eps))/(M[k]), 2) for k in keys_safe)
+                        KL_post_M = sum(post_safe.get(k, eps) * math.log((post_safe.get(k, eps))/(M[k]), 2) for k in keys_safe)
+                        js_val = 0.5 * KL_pre_M + 0.5 * KL_post_M
+                    
+                    JS_ltm_per_order.append(js_val)
                 
-                # Store all metrics for this note
-                note_list.append({'idx':i, 'IC':IC, 'Entropy':Ent, 'KL':KL})
+                # Probability merging LTM and STM (same as getSurprisefromFile)
+                p_pre = L.getLikelihood(L.LTM[vp_idx], ctx, note, short_term_only=short_term_only, long_term_only=long_term_only)
+                
+                # Approximate entropy per viewpoint: LTM-only then STM-only then merged
+                model = L.LTM[vp_idx]
+                # Long-term entropy (approx across orders)
+                e1 = model.getEntropy(ctx, genuine_entropies=False)
+                e2 = None
+                if not long_term_only:
+                    # build STM for this viewpoint
+                    STM = longTermModel(vp, maxOrder=maxOrder, STM=True, init=ctx, use_original_PPM=use_original_PPM)
+                    STM.train([ctx], shortTerm=True)
+                    # 先算一下 STM 的 P(ctx->note)，让它的 entropies[str(ctx)] 被填充
+                    _ = STM.getLikelihood(ctx, note)
+                    e2 = STM.getEntropy(ctx, genuine_entropies=False)
+                
+                # choose or merge entropies
+                if long_term_only:
+                    Ent_pre = e1
+                elif short_term_only:
+                    Ent_pre = e2
+                elif e2 is not None and L.stm:
+                    Ent_pre = L.mergeProbas([
+                        e1, e2
+                    ], [
+                        model.getRelativeEntropy(ctx, genuine_entropies=False),
+                        STM.getRelativeEntropy(ctx, genuine_entropies=False)
+                    ])
+                else:
+                    Ent_pre = e1
+                
+                IC_pre = -math.log(p_pre + eps, 2)
+                
+                # Store metrics: IC, Entropy, per-order LTM KL, and per-order LTM JS
+                note_list.append({
+                    'idx': i,
+                    'IC': IC_pre,
+                    'Entropy': Ent_pre,
+                    'KL_ltm_per_order': KL_ltm_per_order,
+                    'JS_ltm_per_order': JS_ltm_per_order
+                })
             
             file_out[vp] = note_list  # Store note list for this viewpoint
         
+        # Update cumulative note count (all viewpoints have same count)
+        note_count = len(file_out[viewPoints[0]])
+        cum_count += note_count
         results[fname] = file_out  # Store file results
     
+    # Attach meta info for plotting boundaries
+    results['_meta_'] = {'file_order': file_order, 'piece_starts': piece_starts}
     # Save results to output directory
     base = os.path.basename(folder.rstrip('/'))  # Get folder name for output
     out_dir = os.path.join('out', base+'_notewise')
@@ -390,227 +550,166 @@ def update(folder, initialization="", quantization=24, maxOrder=20, time_represe
 
 
 def SurpriseOverFolder(folderTrain, folder, k_fold=5, quantization=24, maxOrder=20, time_representation=False, \
-											zero_padding=True, long_term_only=False, short_term_only=False,\
-											viewPoints=["pitch", "length"], genuine_entropies=False, use_original_PPM=False):
-	
-	'''
-	Train a model (or load it if already saved) and evaluate it on the passed folder.
-	Computed the surprise signal for each file in the folder
-	'''
+                                        zero_padding=True, long_term_only=False, short_term_only=False,\
+                                        viewPoints=["pitch", "length"], genuine_entropies=False, use_original_PPM=False):
 
-	L = idyom.idyom()
+    '''
+    Train a model (or load it if already saved) and evaluate it on the passed folder.
+    Computed the surprise signal for each file in the folder
+    '''
 
-	if folderTrain[-1] == "/":
-		folderTrain = folderTrain[:-1]
+    L = idyom.idyom()
 
-	if folder[-1] != "/":
-		folder += "/"
+    if folderTrain[-1] == "/":
+        folderTrain = folderTrain[:-1]
 
-	name_train = folderTrain[folderTrain[:-1].rfind("/")+1:] + "/"
+    if folder[-1] != "/":
+        folder += "/"
 
-	name = folder[folder[:-1].rfind("/")+1:]
+    name_train = folderTrain[folderTrain[:-1].rfind("/")+1:] + "/"
 
-	if not os.path.exists("out/"+name):
-	    os.makedirs("out/"+name)
+    name = folder[folder[:-1].rfind("/")+1:]
 
-	if not os.path.exists("out/"+name+"surprises/"):
-	    os.makedirs("out/"+name+"surprises/")
+    if not os.path.exists("out/"+name):
+        os.makedirs("out/"+name)
 
-	if not os.path.exists("out/"+name+"surprises/"+name_train):
-	    os.makedirs("out/"+name+"surprises/"+name_train)
+    if not os.path.exists("out/"+name+"surprises/"):
+        os.makedirs("out/"+name+"surprises/")
 
-	if not os.path.exists("out/"+name+"surprises/"+name_train+"data/"):
-	    os.makedirs("out/"+name+"surprises/"+name_train+"data/")
+    if not os.path.exists("out/"+name+"surprises/"+name_train):
+        os.makedirs("out/"+name+"surprises/"+name_train)
 
-	if not os.path.exists("out/"+name+"surprises/"+name_train+"figs/"):
-	    os.makedirs("out/"+name+"surprises/"+name_train+"figs/")
+    if not os.path.exists("out/"+name+"surprises/"+name_train+"data/"):
+        os.makedirs("out/"+name+"surprises/"+name_train+"data/")
 
-	ppm_name = "_originalPPM" if use_original_PPM else ""
-	if os.path.isfile("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name + ".model"):
-		print("We load saved model.")
-		L.load("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name + ".model")
-	else:
-		print("No saved model found, please train before.")
-		print("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name + ".model")
-		quit()
+    if not os.path.exists("out/"+name+"surprises/"+name_train+"figs/"):
+        os.makedirs("out/"+name+"surprises/"+name_train+"figs/")
 
-	S, E, files = L.getSurprisefromFolder(folder, time_representation=time_representation, long_term_only=long_term_only, short_term_only=short_term_only, genuine_entropies=genuine_entropies)
+    ppm_name = "_originalPPM" if use_original_PPM else ""
+    if os.path.isfile("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name + ".model"):
+        print("We load saved model.")
+        L.load("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name + ".model")
+    else:
+        print("No saved model found, please train before.")
+        print("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name + ".model")
+        quit()
 
-	data = {}
+    S, files = L.getSurprisefromFolder(folder, time_representation=time_representation, long_term_only=long_term_only, short_term_only=short_term_only)
 
-	for i in range(len(S)):
-		name_tmp = files[i][files[i].rfind("/")+1:files[i].rfind(".")]
-		name_tmp = name_tmp.replace("-", "_")
-		data[name_tmp] = [np.array(S[i]).tolist(), np.array(E[i]).tolist()]
-	data["info"] = "Each variable corresponds to a song. For each song you have the Information Content as the first dimension, and then the Relative Entropy as the second dimension. They are both vectors over the time dimension."
+    data = {}
 
-	more_info = ""
-	if long_term_only:
-		more_info += "_longTermOnly"
-	if short_term_only:
-		more_info += "_shortTermOnly" 
-	
-	ppm_name = "_originalPPM" if use_original_PPM else ""
-	more_info += "_quantization_"+str(quantization) + "_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name
+    for i in range(len(S)):
+        name_tmp = files[i][files[i].rfind("/")+1:files[i].rfind(".")]
+        name_tmp = name_tmp.replace("-", "_")
+        data[name_tmp] = np.array(S[i]).tolist()
 
+    more_info = ""
+    if long_term_only:
+        more_info += "_longTermOnly"
+    if short_term_only:
+        more_info += "_shortTermOnly" 
 
-	sio.savemat("out/"+name+"surprises/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.mat', data)
-	pickle.dump(data, open("out/"+name+"surprises/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.pickle', "wb" ) )
+    ppm_name = "_originalPPM" if use_original_PPM else ""
+    more_info += "_quantization_"+str(quantization) + "_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name
 
-	print()
-	print()
-	print()
-	print("Data have been succesfully saved in:","out/"+name+"surprises/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.mat')
-	print("Including a .mat for matlab purpose and a .pickle for python purpose.")
-	print()
-	print()
+    S, E, files = L.getSurprisefromFolder(folder, time_representation=time_representation, \
+                                        long_term_only=long_term_only, short_term_only=short_term_only, genuine_entropies=genuine_entropies)
+
+    data = {}
+
+    for i in range(len(S)):
+        name_tmp = files[i][files[i].rfind("/")+1:files[i].rfind(".")]
+        name_tmp = name_tmp.replace("-", "_")
+        data[name_tmp] = [np.array(S[i]).tolist(), np.array(E[i]).tolist()]
+
+    data["info"] = "Each file corresponds to a song. For each song you have the Information Content as the first element, and then the Relative Entropy as the second element. They are both vectors over the time dimension."
+
+    sio.savemat("out/"+name+"surprises/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.mat', data)
+    pickle.dump(data, open("out/"+name+"surprises/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.pickle', "wb" ) )
+
+    print()
+    print()
+    print()
+    print("Data (surprises/IC)have been succesfully saved in:","out/"+name+"surprises/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.mat')
+    print("Including a .mat for matlab purpose and a .pickle for python purpose.")
+    print()
+    print()
+
 
 def SilentNotesOverFolder(folderTrain, folder, threshold=0.3, k_fold=5, quantization=24, maxOrder=20, time_representation=False, \
-											zero_padding=True, long_term_only=False, short_term_only=False, \
-											viewPoints=["pitch", "length"], use_original_PPM=False):
-	
-	'''
-	Function used in The music of silence. Part II: Cortical Predictions during Silent Musical Intervals (https://www.jneurosci.org/content/41/35/7449)
-	It computes the probabily to have a note in each natural musical silences (using only the duration/rythm dimension). 
-	'''
+                                        zero_padding=True, long_term_only=False, short_term_only=False, \
+                                        viewPoints=["pitch", "length"], use_original_PPM=False):
 
-	L = idyom.idyom()
+    '''
+    Function used in The music of silence. Part II: Cortical Predictions during Silent Musical Intervals (https://www.jneurosci.org/content/41/35/7449)
+    It computes the probabily to have a note in each natural musical silences (using only the duration/rythm dimension). 
+    '''
 
-	if folderTrain[-1] == "/":
-		folderTrain = folderTrain[:-1]
+    L = idyom.idyom()
 
-	if folder[-1] != "/":
-		folder += "/"
+    if folderTrain[-1] == "/":
+        folderTrain = folderTrain[:-1]
 
-	name_train = folderTrain[folderTrain[:-1].rfind("/")+1:] + "/"
+    if folder[-1] != "/":
+        folder += "/"
 
-	name = folder[folder[:-1].rfind("/")+1:]
+    name_train = folderTrain[folderTrain[:-1].rfind("/")+1:] + "/"
 
-	if not os.path.exists("out/"+name):
-	    os.makedirs("out/"+name)
+    name = folder[folder[:-1].rfind("/")+1:]
 
-	if not os.path.exists("out/"+name+"missing_notes/"):
-	    os.makedirs("out/"+name+"missing_notes/")
+    if not os.path.exists("out/"+name):
+        os.makedirs("out/"+name)
 
-	if not os.path.exists("out/"+name+"missing_notes/"+name_train):
-	    os.makedirs("out/"+name+"missing_notes/"+name_train)
+    if not os.path.exists("out/"+name+"missing_notes/"):
+        os.makedirs("out/"+name+"missing_notes/")
 
-	if not os.path.exists("out/"+name+"missing_notes/"+name_train+"data/"):
-	    os.makedirs("out/"+name+"missing_notes/"+name_train+"data/")
+    if not os.path.exists("out/"+name+"missing_notes/"+name_train):
+        os.makedirs("out/"+name+"missing_notes/"+name_train)
 
-	if not os.path.exists("out/"+name+"missing_notes/"+name_train+"figs/"):
-	    os.makedirs("out/"+name+"missing_notes/"+name_train+"figs/")
+    if not os.path.exists("out/"+name+"missing_notes/"+name_train+"data/"):
+        os.makedirs("out/"+name+"missing_notes/"+name_train+"data/")
 
-
-	if os.path.isfile("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder) +"_viewpoints_"+vstr(viewPoints)+ ".model"):
-		print("We load saved model.")
-		L.load("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ".model")
-	else:
-		print("No saved model found, please train before.")
-		print("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ".model")
-		quit()
-
-	S, files = L.getDistributionsfromFolder(folder, threshold, time_representation=time_representation, long_term_only=long_term_only, short_term_only=short_term_only)
-
-	data = {}
-
-	for i in range(len(S)):
-		name_tmp = files[i][files[i].rfind("/")+1:files[i].rfind(".")]
-		name_tmp = name_tmp.replace("-", "_")
-		data[name_tmp] = np.array(S[i]).tolist()
-
-	more_info = ""
-	if long_term_only:
-		more_info += "_longTermOnly"
-	if short_term_only:
-		more_info += "_shortTermOnly" 
-
-	ppm_name = "_originalPPM" if use_original_PPM else ""
-	more_info += "_quantization_"+str(quantization) + "_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name
+    if not os.path.exists("out/"+name+"missing_notes/"+name_train+"figs/"):
+        os.makedirs("out/"+name+"missing_notes/"+name_train+"figs/")
 
 
-	sio.savemat("out/"+name+"missing_notes/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.mat', data)
-	pickle.dump(data, open("out/"+name+"missing_notes/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.pickle', "wb" ) )
+    if os.path.isfile("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder) +"_viewpoints_"+vstr(viewPoints)+ ".model"):
+        print("We load saved model.")
+        L.load("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ".model")
+    else:
+        print("No saved model found, please train before.")
+        print("models/"+ str(folderTrain[folderTrain.rfind("/")+1:]) + "_quantization_"+str(quantization)+"_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ".model")
+        quit()
 
-	print()
-	print()
-	print()
-	print("Data (surprises/IC)have been succesfully saved in:","out/"+name+"missing_notes/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.mat')
-	print("Including a .mat for matlab purpose and a .pickle for python purpose.")
-	print()
-	print()
+    S, files = L.getDistributionsfromFolder(folder, threshold, time_representation=time_representation, long_term_only=long_term_only, short_term_only=short_term_only)
 
-	if not os.path.exists("out/"+name+"missing_notes/"+name_train+"figs/"+more_info[1:]):
-	    os.makedirs("out/"+name+"missing_notes/"+name_train+"figs/"+more_info[1:])
+    data = {}
 
-	for i in range(len(files)):
-		plt.plot(S[i][0])
-		plt.plot(S[i][1])
-		plt.legend(["Actual Notes", "Missing Notes"])
-		plt.title("Piece: " + files[i])
-		plt.savefig("out/"+name+"missing_notes/"+name_train+"figs/"+more_info[1:]+"/"+str(files[i][files[i].rfind("/")+1:files[i].rfind(".")])+'.eps')
-		if not SERVER:
-			plt.show()
-		else:
-			plt.close()
+    for i in range(len(S)):
+        name_tmp = files[i][files[i].rfind("/")+1:files[i].rfind(".")]
+        name_tmp = name_tmp.replace("-", "_")
+        data[name_tmp] = np.array(S[i]).tolist()
 
+    more_info = ""
+    if long_term_only:
+        more_info += "_longTermOnly"
+    if short_term_only:
+        more_info += "_shortTermOnly" 
 
-
-
-def evaluation(folder, k_fold=5, quantization=24, maxOrder=20, time_representation=False, \
-				zero_padding=True, long_term_only=False, short_term_only=False, viewPoints="both", genuine_entropies=False, use_original_PPM=False):
-
-	'''
-	Main function for the cross-validation
-	'''
-	if folder[-1] != "/":
-		folder += "/"
-
-	name = folder[folder[:-1].rfind("/")+1:]
+    ppm_name = "_originalPPM" if use_original_PPM else ""
+    more_info += "_quantization_"+str(quantization) + "_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name
 
 
-	if not os.path.exists("out/"+name):
-	    os.makedirs("out/"+name)
+    sio.savemat("out/"+name+"missing_notes/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.mat', data)
+    pickle.dump(data, open("out/"+name+"missing_notes/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.pickle', "wb" ) )
 
-	if not os.path.exists("out/"+name+"eval/"):
-	    os.makedirs("out/"+name + "eval/")
-
-	if not os.path.exists("out/"+name+"eval/data/"):
-	    os.makedirs("out/"+name+"eval/data/")
-
-	if not os.path.exists("out/"+name+"eval/figs/"):
-	    os.makedirs("out/"+name+"eval/figs/")
-
-
-	more_info = "_"
-	if long_term_only:
-		more_info += "long_term_only_"
-	if short_term_only:
-		more_info += "short_term_only_"
-
-	ppm_name = "_originalPPM" if use_original_PPM else ""
-	more_info += "k_fold_"+str(k_fold)+"_quantization_"+str(quantization) + "_maxOrder_"+str(maxOrder)+"_viewpoints_"+vstr(viewPoints) + ppm_name
-
-	S, E, files = cross_validation(folder, maxOrder=maxOrder, quantization=quantization, k_fold=k_fold, time_representation=time_representation, \
-												long_term_only=long_term_only, short_term_only=short_term_only, genuine_entropies=genuine_entropies, use_original_PPM=use_original_PPM)
-	data = {}
-	for i in range(len(S)):
-		data[files[i]] = np.array(S[i]).tolist()
-		data[files[i]] = [np.array(S[i]).tolist(), np.array(E[i]).tolist()]
-	data["info"] = "Each variable corresponds to a song. For each song you have the Information Content as the first dimension, and then the Relative Entropy as the second dimension. They are both vectors over the time dimension."
-
-
-
-	sio.savemat("out/"+name+'eval/data/likelihoods_cross-eval'+more_info+'.mat', data)
-	pickle.dump(data, open("out/"+name+'eval/data/likelihoods_cross-eval'+more_info+'.pickle', "wb" ) )
-
-	print()
-	print()
-	print()
-	print("Data have been succesfully saved in:","out/"+name+'eval/data/likelihoods_cross-eval'+more_info+'.pickle')
-	print("Including a .mat for matlab purpose and a .pickle for python purpose.")
-	print()
-	print()
+    print()
+    print()
+    print()
+    print("Data (surprises/IC)have been succesfully saved in:","out/"+name+"missing_notes/"+name_train+"data/"+str(folderTrain[folderTrain.rfind("/")+1:])+more_info+'.mat')
+    print("Including a .mat for matlab purpose and a .pickle for python purpose.")
+    print()
+    print()
 
 
 if __name__ == "__main__":

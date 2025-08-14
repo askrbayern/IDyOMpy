@@ -6,6 +6,8 @@ import numpy as np
 import pickle
 from tqdm import tqdm
 import math
+import logging
+logger = logging.getLogger(__name__)
 
 VERBOSE = False	
 
@@ -268,6 +270,60 @@ class longTermModel():
 		if self.use_original_PPM:
 			return self.mergeProbasPPM(state, note)
 		return self.mergeProbas(probas, np.array(weights))
+
+	# ============= new add KL ====================
+	def getKL(self, state, note):
+		"""
+		Return the simplified KL divergence summed across model orders.
+
+		:param state: context sequence
+		:param note: observed note
+
+		:type state: np.array(length)
+		:type note:	int or string
+
+		:return: KL (float)
+		"""
+		# import math
+		
+
+		kls = []
+		# higher-order chains
+		for model in self.models:
+			if model.order <= len(state):
+				context = str(list(state[-model.order:]))
+				N = model.getTotalCount(context)
+				a_k = model.getCount(context, str(note))
+				if N > 0:
+					kl = math.log((N + 1) / N)
+					# use a_k+1 denominator for strict closed-form
+					if a_k > 0:
+						kl += (a_k / N) * math.log(a_k / (a_k + 1))
+					# log per-order negative KL
+					if kl < 0:
+						logger.debug(f"getKL negative at order {model.order}: context={context}, N={N}, a_k={a_k}, kl={kl}")
+					kls.append(kl)
+		# order-0 model
+		N0 = self.modelOrder0.getTotalCount()
+		a_k0 = self.modelOrder0.getCount(str(note))
+		if N0 > 0:
+			kl0 = math.log((N0 + 1) / N0)
+			# strict closed-form uses a_k0+1
+			if a_k0 > 0:
+				kl0 += (a_k0 / N0) * math.log(a_k0 / (a_k0 + 1))
+			# log zero-order negative KL
+			if kl0 < 0:
+				logger.debug(f"getKL negative at order0: N0={N0}, a_k0={a_k0}, kl0={kl0}")
+			kls.append(kl0)
+		# sum contributions from all orders
+		if kls:
+			total_kl = sum(kls)
+			if total_kl < 0:
+				logger.debug(f"getKL total negative: state={state}, note={note}, kls={kls}, total={total_kl}")
+			return total_kl
+		else:
+			return 0.0
+	# ============= end of getKL method ===========
 
 	def mergeProbas(self, probas, weights, b=1):
 		"""

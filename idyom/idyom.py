@@ -141,11 +141,17 @@ class idyom():
 
 		probas = np.ones((D.getSizeofPiece(0), len(self.viewPoints)))
 		entropies = np.zeros((D.getSizeofPiece(0), len(self.viewPoints)))
+		# ============= new add KL ====================
+		kls = np.zeros((D.getSizeofPiece(0), len(self.viewPoints)))
+		# ============= end of KL initialization ======
 
 		for model in self.LTM:
 			if model.viewPoint == "pitch":
 				probas[0,0] = model.modelOrder0.getLikelihood(D.getData(model.viewPoint)[0][0])
 				entropies[0,0] = model.modelOrder0.getEntropy()
+				# ============= new add KL ====================
+				kls[0,0] = 0  # First note has no KL
+				# ============= end of KL for first note ======
 
 		v = 0
 		for model in self.LTM:
@@ -159,12 +165,46 @@ class idyom():
 					add = 0
 				probas[i, v] = self.getLikelihood(model, dat[:i-add], dat[i-add], short_term_only=short_term_only, long_term_only=long_term_only)
 				entropies[i, v] = self.getEntropy(model, dat[:i-add], short_term_only=short_term_only, long_term_only=long_term_only)
+				
+				# ============= new add KL computation ========
+				# Compute KL divergence
+				if long_term_only:
+					kls[i, v] = model.getKL(dat[:i-add], dat[i-add])
+				elif short_term_only:
+					# For short-term only, create STM and compute its KL
+					if len(dat[:i-add]) > 0:
+						STM = longTermModel.longTermModel(model.viewPoint, maxOrder=self.maxOrder, STM=True, init=dat[:i-add], use_original_PPM=self.use_original_PPM)
+						STM.train([dat[:i-add]], shortTerm=True)
+						kls[i, v] = STM.getKL(dat[:i-add], dat[i-add])
+					else:
+						kls[i, v] = 0
+				else:
+					# For combined STM+LTM
+					kl_ltm = model.getKL(dat[:i-add], dat[i-add])
+					if len(dat[:i-add]) > 0:
+						STM = longTermModel.longTermModel(model.viewPoint, maxOrder=self.maxOrder, STM=True, init=dat[:i-add], use_original_PPM=self.use_original_PPM)
+						STM.train([dat[:i-add]], shortTerm=True)
+						kl_stm = STM.getKL(dat[:i-add], dat[i-add])
+
+						# sum of LTM and STM
+						kls[i, v] = kl_ltm + kl_stm
+					else:
+						kls[i, v] = kl_ltm
+				# ============= end of KL computation =========
 			v += 1
 
 		probas = np.prod(probas, axis=1)
 		entropies = np.sum(entropies, axis=1)
+		# ============= new add KL aggregation ========
+		# Only expose per-viewpoint KL
+		kls_by_viewpoint = {}
+		for idx, model in enumerate(self.LTM):
+			kls_by_viewpoint[model.viewPoint] = kls[:, idx].copy()
+		# ============= end of KL aggregation =========
 
-		return probas, entropies
+		# ============= new return with KL ============
+		return probas, entropies, kls_by_viewpoint
+		# ============= end of modified return ========
 
 	def getLikelihoodfromFileSimplifiedEntropies(self, file, short_term_only=False, long_term_only=False):
 		"""
@@ -183,11 +223,20 @@ class idyom():
 
 		probas = np.ones(D.getSizeofPiece(0))
 		entropies = np.zeros(D.getSizeofPiece(0))
+		# ============= new add KL ====================
+		kls_by_viewpoint = {}
+		# ============= end of KL initialization ======
 
 		for model in self.LTM:
+			# init per-viewpoint container
+			if model.viewPoint not in kls_by_viewpoint:
+				kls_by_viewpoint[model.viewPoint] = np.zeros(D.getSizeofPiece(0))
 			if model.viewPoint == "pitch":
 				probas[0] = model.modelOrder0.getLikelihood(D.getData(model.viewPoint)[0][0])
 				entropies[0] = model.modelOrder0.getEntropy()
+				# ============= new add KL ====================
+				kls_by_viewpoint[model.viewPoint][0] = 0  # First note has no KL
+				# ============= end of KL for first note ======
 
 		for model in self.LTM:
 			dat = D.getData(model.viewPoint)[0]
@@ -222,6 +271,28 @@ class idyom():
 						e2 = 4.9
 					else:
 						e2 = STM.getEntropy(dat[:i])
+				
+				# ============= new add KL computation ========
+				# Compute KL divergence
+				if long_term_only:
+					kl = model.getKL(dat[:i], dat[i])
+				elif short_term_only:
+					if dat[:i] != []:
+						kl = STM.getKL(dat[:i], dat[i])
+					else:
+						kl = 0
+				else:
+					# Combined STM+LTM
+					kl_ltm = model.getKL(dat[:i], dat[i])
+					if dat[:i] != []:
+						kl_stm = STM.getKL(dat[:i], dat[i])
+
+						# sum of LTM and STM
+						kl = kl_ltm + kl_stm  # Sum as suggested
+					else:
+						kl = kl_ltm
+				# ============= end of KL computation =========
+				
 				if long_term_only:
 					p = p1
 					e = e1
@@ -250,9 +321,14 @@ class idyom():
 				if i < len(probas):
 					probas[i] *= p
 					entropies[i] += e
+					# ============= new add KL accumulation =======
+					kls_by_viewpoint[model.viewPoint][i] += kl  # per-viewpoint KL
+					# ============= end of KL accumulation ========
 
 
-		return probas, entropies
+		# ============= new return with KL ============
+		return probas, entropies, kls_by_viewpoint
+		# ============= end of modified return ========
 
 
 	def getLikelihood(self, model, context, nextNote, short_term_only=False, long_term_only=False):
@@ -492,16 +568,22 @@ class idyom():
 
 		if genuine_entropies is False:
 			# We use the approx
-			probas, entropies = self.getLikelihoodfromFileSimplifiedEntropies(file, short_term_only=short_term_only, long_term_only=long_term_only)
+			# ============= new handle KL return ==========
+			probas, entropies, kls_by_viewpoint = self.getLikelihoodfromFileSimplifiedEntropies(file, short_term_only=short_term_only, long_term_only=long_term_only)
+			# ============= end of KL handling ============
 		else:
 			# We compute the genuine entropies (takes 5 times longer)
-			probas, entropies = self.getLikelihoodfromFile(file, short_term_only=short_term_only, long_term_only=long_term_only)
+			# ============= new handle KL return ==========
+			probas, entropies, kls_by_viewpoint = self.getLikelihoodfromFile(file, short_term_only=short_term_only, long_term_only=long_term_only)
+			# ============= end of KL handling ============
 
 		# We compute the surprise by using -log2(probas)
 		probas = -np.log(probas+sys.float_info.epsilon)/np.log(2)
 
 		if time_representation is False:
-			return probas, entropies
+			# ============= new return with KL ============
+			return probas, entropies, kls_by_viewpoint
+			# ============= end of modified return ========
 
 		D = data.data()
 		D.addFile(file)
@@ -510,18 +592,36 @@ class idyom():
 
 		surprise = []
 		entropy = []
+		# ============= new add KL list ==============
+		kl_by_viewpoint = {vp: [] for vp in kls_by_viewpoint.keys()}
+		# ============= end of KL list init ==========
+		
 		for i in range(len(probas)):
 			surprise.append(probas[i])
 			entropy.append(entropies[i])
+			# ============= new add KL append ============
+			for vp, arr in kls_by_viewpoint.items():
+				kl_by_viewpoint[vp].append(arr[i])
+			# ============= end of KL append =============
 			for j in range(int(lengths[i])):
 				if zero_padding:
 					surprise.append(0)
 					entropy.append(0)
+					# ============= new add KL zero padding ======
+					for vp in kl_by_viewpoint.keys():
+						kl_by_viewpoint[vp].append(0)
+					# ============= end of KL zero padding ========
 				else:
 					surprise.append(probas[i])
 					entropy.append(entropies[i])
+					# ============= new add KL padding ===========
+					for vp, arr in kls_by_viewpoint.items():
+						kl_by_viewpoint[vp].append(arr[i])
+					# ============= end of KL padding ============
 
-		return surprise, entropy
+		# ============= new return with KL ============
+		return surprise, entropy, kl_by_viewpoint
+		# ============= end of modified return ========
 
 	def getLikelihoodfromData(self, D):
 
@@ -555,16 +655,26 @@ class idyom():
 		"""
 		likelihoods = []
 		entropies = []
+		# ============= new add KL list ==============
+		kls_by_vp_all = []
+		# ============= end of KL list init ==========
 		files = []
 		for filename in glob(folder + '/**', recursive=True):
 			if filename[filename.rfind("."):] in [".mid", ".midi"]:
-				L, E = self.getSurprisefromFile(filename, time_representation=time_representation, \
+				# ============= new handle KL return ==========
+				L, E, K_by_vp = self.getSurprisefromFile(filename, time_representation=time_representation, \
 					zero_padding=zero_padding, short_term_only=short_term_only, long_term_only=long_term_only, genuine_entropies=genuine_entropies)
+				# ============= end of KL handling ============
 				likelihoods.append(L)
 				entropies.append(E)
+				# ============= new add KL append ============
+				kls_by_vp_all.append(K_by_vp)
+				# ============= end of KL append =============
 				files.append(filename)
 
-		return likelihoods, entropies, files
+		# ============= new return with KL ============
+		return likelihoods, entropies, kls_by_vp_all, files
+		# ============= end of modified return ========
 
 
 	def sample(self, sequence):
